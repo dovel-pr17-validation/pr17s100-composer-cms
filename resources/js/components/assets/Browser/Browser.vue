@@ -1,0 +1,1064 @@
+<template>
+    <div ref="browser" class="h-full" @keydown.shift="shiftDown" @keyup="clearShift">
+        <Uploader
+            ref="internalUploader"
+            :container="container.id"
+            :path="path"
+            :enabled="!uploader && !preventDragging && canUpload"
+            @updated="uploadsUpdated"
+            @upload-complete="uploadCompleted"
+            @error="uploadError"
+            v-slot="{ dragging }"
+        >
+            <div class="pb-1">
+                <div class="drag-notification" v-show="dragging">
+                    <Icon name="upload-cloud-large" class="m-4 size-13" />
+                    <span>{{ __('Drop File to Upload') }}</span>
+                </div>
+
+                <Listing
+                    ref="listing"
+                    :url="requestUrl"
+                    :columns="columns"
+                    :sort-column="sortColumn"
+                    :sort-direction="sortDirection"
+                    :filters="filters"
+                    :action-url="actionUrl"
+                    :action-context="actionContext"
+                    :allow-bulk-actions="allowBulkActions"
+                    :allow-select-all-matching="false"
+                    :selections="selectedAssets"
+                    :max-selections="maxFiles"
+                    :preferences-prefix="preferencesPrefix"
+                    :additional-parameters="additionalParameters"
+                    v-model:search-query="searchQuery"
+                    @request-completed="listingRequestCompleted"
+                    @update:selections="$emit('selections-updated', $event)"
+                >
+                    <template #default="{ items }">
+                        <slot name="header" v-bind="{ canUpload, openFileBrowser, canCreateFolders, startCreatingFolder, mode, modeChanged }">
+                            <Header :title="__(container.title)" icon="assets">
+                                <ItemActions
+                                    ref="containerActions"
+                                    :url="container.actions_url"
+                                    :actions="container.actions"
+                                    :item="container.id"
+                                    @completed="containerActionCompleted"
+                                    v-slot="{ actions }"
+                                >
+                                    <Dropdown v-if="container.can_edit || container.can_delete || container.can_edit_blueprint || actions.length">
+                                        <DropdownMenu>
+                                            <DropdownItem
+                                                icon="container-add"
+                                                v-if="canCreateContainers"
+                                                :text="__('Create Container')"
+                                                :href="createContainerUrl"
+                                            />
+                                            <DropdownItem
+                                                icon="cog"
+                                                v-if="container.can_edit"
+                                                :text="__('Configure Container')"
+                                                :href="container.edit_url"
+                                            />
+                                            <DropdownItem
+                                                icon="blueprint-edit"
+                                                v-if="container.can_edit_blueprint"
+                                                :text="__('Edit Blueprint')"
+                                                :href="container.blueprint_url"
+                                            />
+                                            <DropdownSeparator v-if="(canCreateContainers || container.can_edit || container.can_edit_blueprint) && actions.length" />
+                                            <DropdownItem
+                                                v-for="action in actions"
+                                                :key="action.handle"
+                                                :text="__(action.title)"
+                                                :icon="action.icon"
+                                                :variant="action.dangerous ? 'destructive' : 'default'"
+                                                @click="action.run"
+                                            />
+                                            <DropdownSeparator v-if="container.can_delete" />
+                                            <DropdownItem
+                                                icon="trash"
+                                                variant="destructive"
+                                                v-if="container.can_delete"
+                                                :text="__('Delete Container')"
+                                                @click="$event.preventDefault(); $refs.deleter.confirm()"
+                                            />
+                                        </DropdownMenu>
+                                    </Dropdown>
+                                </ItemActions>
+
+                                <resource-deleter
+                                    ref="deleter"
+                                    :resource-title="__(container.title)"
+                                    :route="container.delete_url"
+                                />
+
+                                <Button v-if="canUpload" :text="__('Upload')" icon="upload" @click="openFileBrowser" />
+                                <Button v-if="canCreateFolders" :text="__('Create Folder')" icon="folder-add" @click="startCreatingFolder" />
+
+                                <ToggleGroup :model-value="mode" @update:model-value="modeChanged">
+                                    <ToggleItem icon="layout-grid" value="grid" />
+                                    <ToggleItem icon="layout-list" value="table" />
+                                </ToggleGroup>
+                            </Header>
+
+                            <div class="flex items-center gap-2 sm:gap-3 py-3 relative overflow-clip st-overflow-clip-margin">
+                                <div class="flex flex-1 items-center gap-2 sm:gap-3">
+                                    <ListingSearch :label="__('Search assets')" />
+                                    <ListingFilters @filters-updated="filtersUpdated" />
+                                </div>
+                                <ListingCustomizeColumns v-if="mode === 'table'" />
+                            </div>
+                        </slot>
+
+                        <div
+                            v-if="containerIsEmpty && !creatingFolder"
+                            class="rounded-lg border border-dashed border-gray-300 dark:border-gray-700 p-6 text-center text-gray-500"
+                            v-text="__('No results')"
+                        />
+
+                        <Panel v-else :class="{ 'relative overflow-x-auto overscroll-x-contain': mode === 'table' }">
+                            <PanelHeader class="flex items-center justify-between gap-2 px-1!">
+                                <Breadcrumbs
+                                    v-if="!restrictFolderNavigation"
+                                    :path="path"
+                                    :droppable="draggingMovable"
+                                    :current-droppable="isSearching"
+                                    :open-paths="openDropPaths"
+                                    @navigated="selectFolder"
+                                    @dropped="moveDraggedItemToFolder"
+                                />
+                                <div v-if="mode === 'grid'" class="flex items-center gap-2 mr-2">
+                                    <ui-button
+                                        inset
+                                        size="sm"
+                                        variant="ghost"
+                                        icon-only
+                                        :icon="checkerboardIcon"
+                                        v-tooltip="__('Transparency')"
+                                        :aria-label="__('Transparency')"
+                                        @click="cycleCheckerboard"
+                                    />
+                                    <Slider
+                                        size="sm"
+                                        class="w-24!"
+                                        variant="subtle"
+                                        v-model="gridThumbnailSize"
+                                        :min="60"
+                                        :max="300"
+                                        :step="25"
+                                    />
+                                </div>
+                            </PanelHeader>
+
+                            <Uploads
+                                v-if="uploads.length"
+                                :uploads="uploads"
+                                :allow-selecting-existing="allowSelectingExistingUpload"
+                                class="mb-3 rounded-lg"
+                                @existing-selected="existingUploadSelected"
+                            />
+
+                            <Table
+                                ref="table"
+                                v-if="mode === 'table'"
+                                :assets="items"
+                                :folders="folders"
+                                :columns="columns"
+                                :visible-columns="visibleColumns"
+                                :is-searching="isSearching"
+                                v-bind="sharedAssetProps"
+                                v-on="sharedAssetEvents"
+                            />
+
+                            <Grid
+                                ref="grid"
+                                v-if="mode === 'grid'"
+                                :assets="items"
+                                :action-url="actionUrl"
+                                :thumbnail-size="gridThumbnailSize"
+                                :show-checkerboard="showCheckerboard"
+                                :checkerboard-mode="checkerboardMode"
+                                :reflowing="reflowing"
+                                v-bind="sharedAssetProps"
+                                v-on="sharedAssetEvents"
+                            />
+
+                            <PanelFooter>
+                                <ListingPagination />
+                            </PanelFooter>
+                        </Panel>
+
+                        <slot name="footer" />
+                    </template>
+                </Listing>
+            </div>
+        </Uploader>
+
+        <AssetEditor
+            v-if="showAssetEditor"
+            :id="editedAssetId"
+            :redirect-after-crop="!autoselectUploads"
+            @previous="editPreviousAsset"
+            @next="editNextAsset"
+            @closed="closeAssetEditor"
+            @saved="assetSaved"
+            @created="assetCreated"
+            @action-started="actionStarted"
+            @action-completed="actionCompleted"
+        />
+    </div>
+</template>
+
+<script>
+import AssetThumbnail from './Thumbnail.vue';
+import AssetEditor from '../Editor/Editor.vue';
+import Grid from './Grid.vue';
+import Table from './Table.vue';
+import HasPreferences from '../../data-list/HasPreferences';
+import Uploader from '../Uploader.vue';
+import Uploads from '../Uploads.vue';
+import ItemActions from '@/components/actions/ItemActions.vue';
+import { debounce, sortBy } from 'lodash-es';
+import {
+    Header,
+    Button,
+    ButtonGroup,
+    Dropdown,
+    DropdownSeparator,
+    DropdownItem,
+    DropdownMenu,
+    Panel,
+    PanelHeader,
+    PanelFooter,
+    Listing,
+    ListingTable,
+    ListingPagination,
+    ListingFilters,
+    ListingSearch,
+    ListingCustomizeColumns,
+    Slider,
+    Icon,
+    ToggleGroup,
+    ToggleItem,
+} from '@ui';
+import Breadcrumbs from './Breadcrumbs.vue';
+import useCheckerboard from '@/composables/checkerboard.js';
+import { router } from '@inertiajs/vue3';
+
+// How long after a drop the move animation starts.
+const ANIMATION_DELAY = 250;
+
+// Matches the moved items' fade in AssetBrowserMixin's moveStateClasses(), after which they're removed from the layout.
+const FADE_OUT_DURATION = 300;
+
+// The folder stays open while the move is in progress, but at least this long so quick moves still read.
+// It covers the --animate-folder-open and --animate-folder-file durations in ui.css, plus a short pause.
+const FOLDER_MIN_OPEN_DURATION = 520;
+
+// Matches the --animate-folder-close duration in ui.css.
+const FOLDER_CLOSE_DURATION = 300;
+
+// Long enough for Grid's move transition to finish.
+const REFLOW_DURATION = 400;
+
+export default {
+    mixins: [HasPreferences],
+
+    components: {
+        PanelFooter,
+        Panel,
+        PanelHeader,
+        DropdownMenu,
+        DropdownItem,
+        Dropdown,
+        DropdownSeparator,
+        AssetThumbnail,
+        AssetEditor,
+        ItemActions,
+        Uploader,
+        Uploads,
+        Grid,
+        Table,
+        Header,
+        Button,
+        ButtonGroup,
+        Listing,
+        ListingTable,
+        ListingPagination,
+        ListingSearch,
+        ListingFilters,
+        ListingCustomizeColumns,
+        Breadcrumbs,
+        Slider,
+        Icon,
+        ToggleGroup,
+        ToggleItem,
+    },
+
+    props: {
+        allowBulkActions: {
+            type: Boolean,
+            default: true,
+        },
+        allowSelectingExistingUpload: Boolean,
+        autoselectUploads: Boolean,
+        canCreateContainers: Boolean,
+        createContainerUrl: String,
+        container: Object,
+        initialEditingAssetId: String,
+        maxFiles: Number,
+        queryScopes: Array,
+        restrictFolderNavigation: Boolean, // Whether to restrict to a single folder and prevent navigation.
+        selectedAssets: Array,
+        selectedPath: String, // The path to display, determined by a parent component.
+        filters: Array,
+        initialColumns: {
+            type: Array,
+            default: () => [],
+        },
+        uploader: {
+            type: Object,
+            default: null,
+        },
+    },
+
+    setup() {
+        const checkerboard = useCheckerboard();
+        return {
+            showCheckerboard: checkerboard.enabled,
+            checkerboardIcon: checkerboard.icon,
+            checkerboardMode: checkerboard.mode,
+            cycleCheckerboard: checkerboard.cycle,
+        };
+    },
+
+    data() {
+        return {
+            columns: this.initialColumns,
+            visibleColumns: this.initialColumns.filter(column => column.visible),
+            containers: [],
+            initializing: true,
+            loading: true,
+            assets: [],
+            path: this.selectedPath,
+            folders: [],
+            folder: {},
+            searchQuery: '',
+            activeFilters: {},
+            editedAssetId: this.initialEditingAssetId,
+            creatingFolder: false,
+            creatingFolderError: false,
+            uploads: [],
+            page: 1,
+            preferencesPrefix: `assets.${this.container.id}`,
+            meta: {},
+            sortColumn: this.container.sort_field,
+            sortDirection: this.container.sort_direction,
+            mode: 'table',
+            actionUrl: null,
+            folderActionUrl: null,
+            shifting: false,
+            lastItemClicked: null,
+            preventDragging: false,
+            draggingMovable: false,
+            moving: [],
+            moved: [],
+            removed: [],
+            settlingMoves: [],
+            drops: [],
+            reflowing: false,
+            gridThumbnailSize: this.$preferences.get('assets.browser_thumbnail_size', 200),
+        };
+    },
+
+    computed: {
+        requestUrl() {
+            return this.isSearching
+                ? cp_url(
+                      `assets/browse/search/${this.container.id}/${this.restrictFolderNavigation ? this.path : ''}`,
+                  ).replace(/\/$/, '')
+                : cp_url(`assets/browse/folders/${this.container.id}/${this.path || ''}`).replace(/\/$/, '');
+        },
+
+        actionContext() {
+            return { container: this.container.id };
+        },
+
+        additionalParameters() {
+            return {
+                queryScopes: this.queryScopes,
+            };
+        },
+
+        canCreateFolders() {
+            return this.folder && this.container.can_create_folders && !this.restrictFolderNavigation;
+        },
+
+        canUpload() {
+            return this.folder && this.container.can_upload;
+        },
+
+        containerIsEmpty() {
+            return this.assets.length === 0 && this.folders.length === 0 && (!this.folder || !this.folder.parent_path);
+        },
+
+        editedAssetBasename() {
+            let asset = this.assets.find((asset) => asset.id == this.editedAssetId);
+
+            return asset ? asset.basename : null;
+        },
+
+        hasMaxFiles() {
+            return this.maxFiles !== undefined && this.maxFiles !== Infinity;
+        },
+
+        hasSelections() {
+            return this.selectedAssets.length > 0;
+        },
+
+        hasActiveFilters() {
+            return Object.entries(this.activeFilters).some(([key, value]) => {
+                if (Array.isArray(value)) {
+                    return value.length > 0;
+                } else if (typeof value === 'object' && value !== null) {
+                    return Object.keys(value).length > 0;
+                }
+                return Boolean(value);
+            });
+        },
+
+        isSearching() {
+            return this.searchQuery || this.hasActiveFilters;
+        },
+
+        parameters() {
+            return {
+                page: this.page,
+                perPage: this.perPage,
+                sort: this.sortColumn,
+                order: this.sortDirection,
+                search: this.searchQuery,
+                queryScopes: this.queryScopes,
+                columns: this.visibleColumnParameters,
+            };
+        },
+
+        visibleColumnParameters: {
+            get() {
+                if (this.visibleColumns === null || this.visibleColumns === undefined) {
+                    return null;
+                }
+
+                return this.visibleColumns.map(column => column.field).join(',');
+            },
+            set(value) {
+                this.visibleColumns = value.split(',').map(field => this.columns.find(column => column.field === field));
+            },
+        },
+
+        reachedSelectionLimit() {
+            return this.selectedAssets.length >= this.maxFiles;
+        },
+
+        openDropPaths() {
+            return this.drops.filter((drop) => !drop.closing).map((drop) => drop.path);
+        },
+
+        showAssetEditor() {
+            return Boolean(this.editedAssetId);
+        },
+
+        sharedAssetProps() {
+            return {
+                actionUrl: this.actionUrl,
+                containerIsEmpty: this.containerIsEmpty,
+                folder: this.folder,
+                folderActionUrl: this.folderActionUrl,
+                folders: this.folders,
+                maxFiles: this.maxFiles,
+                restrictFolderNavigation: this.restrictFolderNavigation,
+                path: this.path,
+                selectedAssets: this.selectedAssets,
+                moving: this.moving,
+                moved: this.moved,
+                removed: this.removed,
+                drops: this.drops,
+                creatingFolder: this.creatingFolder,
+                creatingFolderError: this.creatingFolderError,
+            };
+        },
+
+        sharedAssetEvents() {
+            return {
+                'action-completed': this.actionCompleted,
+                'action-started': this.actionStarted,
+                'edit': this.edit,
+                'edit-asset': (event) => this.$emit('edit-asset', event),
+                'select-folder': this.selectFolder,
+                'create-folder': this.createFolder,
+                'cancel-creating-folder': () => {
+                    this.creatingFolder = false;
+                    this.creatingFolderError = false;
+                },
+                'prevent-dragging': (preventDragging) => (this.preventDragging = preventDragging),
+                'dragging-movable': (movable) => (this.draggingMovable = movable),
+                'move-items': this.moveItems,
+                'update:creatingFolderError': (value) => (this.creatingFolderError = value),
+            };
+        },
+    },
+
+    mounted() {
+        this.mode = this.getPreference('mode') || 'table';
+
+        this.addToCommandPalette();
+    },
+
+    watch: {
+        mode(mode) {
+            this.setPreference('mode', mode == 'table' ? null : mode);
+        },
+
+        initializing(initializing) {
+              if (initializing === false) {
+                  this.$emit('initialized');
+              }
+        },
+
+        editedAssetId(editedAssetId) {
+            let path = editedAssetId
+                ? [this.path, this.editedAssetBasename].filter((value) => value != '/').join('/') + '/edit'
+                : this.path;
+
+            this.$emit('navigated', path);
+        },
+
+        loading(loading) {
+            this.$progress.loading('asset-browser', loading);
+        },
+
+        parameters(after, before) {
+            if (this.initializing || JSON.stringify(before) === JSON.stringify(after)) return;
+            this.loadAssets();
+        },
+
+        path(path) {
+            this.loadAssets();
+            this.$emit('path-changed', path);
+        },
+
+        searchQuery() {
+            this.page = 1;
+        },
+
+        activeFilters: {
+            deep: true,
+            handler() {
+                this.page = 1;
+            },
+        },
+
+        selectedPath: {
+            immediate: true,
+            handler(newPath) {
+                if (!newPath.endsWith('/edit')) {
+                    this.path = newPath;
+                }
+            },
+        },
+
+        gridThumbnailSize: {
+            handler: debounce(function (size) {
+                this.$preferences.set('assets.browser_thumbnail_size', size);
+            }, 300),
+        },
+    },
+
+    methods: {
+        filtersUpdated(filters) {
+            this.activeFilters = filters;
+        },
+
+        modeChanged(mode) {
+            this.mode = mode;
+        },
+
+        startCreatingFolder() {
+            this.creatingFolder = true;
+            this.creatingFolderError = false;
+        },
+
+        listingRequestCompleted({ response }) {
+            this.assets = response.data.data;
+
+            if (this.isSearching) {
+                this.folder = null;
+                this.folders = [];
+            } else {
+                const { meta, links } = response.data;
+                this.folder = meta.folder;
+                this.folders = meta.folder.folders;
+                this.actionUrl = links.asset_action;
+                this.folderActionUrl = links.folder_action;
+            }
+
+            this.initializing = false;
+
+            this.settleMoves();
+        },
+
+        actionStarted() {
+            this.loading = true;
+        },
+
+        actionCompleted() {
+            // Intentionally not completing the loading state here since
+            // the listing will refresh and immediately restart it.
+            // this.loading = false;
+
+            this.$refs.listing.refresh();
+        },
+
+        containerActionCompleted(successful, response = {}) {
+            if (!successful) {
+                Statamic.$toast.error(response.message || __('Action failed'));
+                return;
+            }
+
+            if (response.message !== false) {
+                Statamic.$toast.success(response.message || __('Action completed'));
+            }
+
+            if (!response.redirect) router.reload({ onSuccess: () => this.$refs.listing.refresh() });
+        },
+
+        assetSaved() {
+            this.loadAssets();
+        },
+
+        assetCreated(id) {
+            this.closeAssetEditor();
+            this.autoselect(id);
+            this.loadAssets();
+        },
+
+        clearShift() {
+            this.shifting = false;
+        },
+
+        async editPreviousAsset() {
+            let currentAssetIndex = this.assets.findIndex((asset) => asset.id === this.editedAssetId);
+
+            // When we're editing the first asset on the page, navigating to the previous asset
+            // requires us to load the previous page of assets, if there is one.
+            if (currentAssetIndex === 0) {
+                if (this.page > 1) {
+                    this.page = this.page - 1;
+                    await this.loadAssets();
+
+                    if (this.assets.length > 0) {
+                        this.editedAssetId = null;
+
+                        this.$nextTick(() => {
+                            this.editedAssetId = this.assets.slice(-1)[0].id;
+                        });
+                    }
+                }
+
+                this.editedAssetId = null;
+                return;
+            }
+
+            this.editedAssetId = null;
+
+            this.$nextTick(() => {
+                this.editedAssetId = this.assets.slice(currentAssetIndex - 1, currentAssetIndex)[0].id;
+            });
+        },
+
+        async editNextAsset() {
+            let currentAssetIndex = this.assets.findIndex((asset) => asset.id === this.editedAssetId);
+
+            // When we're editing the last asset on the page, navigating to the next asset
+            // requires us to load the next page of assets, if there is one.
+            if (currentAssetIndex === this.assets.length - 1) {
+                if (this.meta.last_page > this.page) {
+                    this.page = this.page + 1;
+                    await this.loadAssets();
+
+                    if (this.assets.length > 0) {
+                        this.editedAssetId = null;
+
+                        this.$nextTick(() => {
+                            this.editedAssetId = this.assets[0].id;
+                        });
+                    }
+                }
+
+                this.editedAssetId = null;
+                return;
+            }
+
+            this.editedAssetId = null;
+
+            this.$nextTick(() => {
+                this.editedAssetId = this.assets.slice(currentAssetIndex + 1, currentAssetIndex + 2)[0].id;
+            });
+        },
+
+        closeAssetEditor() {
+            this.editedAssetId = null;
+        },
+
+        createFolder(name) {
+            this.$axios
+                .post(cp_url(`asset-containers/${this.container.id}/folders`), { path: this.path, directory: name })
+                .then((response) => {
+                    this.$toast.success(__('Folder created'));
+
+                    this.folders.push(response.data);
+                    this.folders = sortBy(this.folders, 'title');
+                    this.creatingFolder = false;
+                    this.creatingFolderError = false;
+
+                    this.$refs.grid?.clearNewFolderName();
+                    this.$refs.table?.clearNewFolderName();
+                })
+                .catch((e) => {
+                    if (e.response && e.response.status === 422) {
+                        const { message, errors } = e.response.data;
+
+                        errors.directory
+                            ? this.$toast.error(errors.directory[0])
+                            : this.$toast.error(message);
+
+                        this.creatingFolderError = true;
+                        this.$refs.grid?.focusNewFolderInput();
+                        this.$refs.table?.focusNewFolderInput();
+                    } else {
+                        this.$toast.error(__('Something went wrong'));
+                        this.creatingFolderError = true;
+                    }
+                });
+        },
+
+        edit(id) {
+            this.editedAssetId = id;
+        },
+
+        existingUploadSelected(upload) {
+            this.selectedAssets.push(upload.existingId);
+            this.$emit('selections-updated', this.selectedAssets);
+        },
+
+        folderActions(folder) {
+            return folder.actions || this.folder.actions || [];
+        },
+
+        loadAssets() {
+            this.$nextTick(() => this.$refs.listing.refresh());
+        },
+
+        openFileBrowser() {
+            (this.uploader || this.$refs.internalUploader).browse();
+        },
+
+        selectFolder(path) {
+            // Trigger re-loading of assets in the selected folder.
+            this.path = path;
+            this.page = 1;
+
+            this.$emit('navigated', this.path);
+        },
+
+        moveItems({ url, action, items, destination }) {
+            const payload = {
+                action: action.handle,
+                context: action.context,
+                selections: items,
+                values: { folder: destination },
+            };
+
+            const files = items.slice(0, 3).map((item) => ({
+                thumbnail: this.assets.find((asset) => asset.id === item)?.thumbnail,
+            }));
+
+            // Dim the items straight away so the drop registers, but hold the animation back a moment
+            // so it finishes closer to when the server does. The request starts immediately.
+            const startedAt = Date.now();
+            let failed = false;
+
+            this.moving.push(...items);
+            this.actionStarted();
+
+            const opened = new Promise((resolve) => setTimeout(resolve, ANIMATION_DELAY)).then(() => {
+                if (failed) return false;
+
+                this.openDrop(destination, files);
+
+                // Search results span every folder, so moved items stay in the listing instead of leaving it.
+                if (this.isSearching) return true;
+
+                const stillMoving = items.filter((item) => this.moving.includes(item));
+
+                this.moving = this.moving.filter((item) => !stillMoving.includes(item));
+                this.moved.push(...stillMoving);
+
+                setTimeout(() => this.removeMovedItems(stillMoving), FADE_OUT_DURATION);
+
+                return true;
+            });
+
+            this.$axios
+                .post(url, payload)
+                .then(({ data }) => {
+                    const folder = destination === '/' ? __('All') : destination.split('/').pop();
+
+                    Statamic.$toast.success(
+                        __n('Moved to :folder|Moved :count items to :folder', items.length, { folder }),
+                    );
+
+                    // Keep the items hidden until the refreshed listing arrives without them.
+                    this.settlingMoves.push({ items, callback: data.callback });
+                })
+                .catch((error) => {
+                    failed = true;
+                    this.forgetMoves(items);
+                    Statamic.$toast.error(error.response?.data?.message || __('Action failed'));
+                })
+                .finally(() => {
+                    opened.then((didOpen) => didOpen && this.closeDrop(destination));
+
+                    // Fast moves wait for the items to fade out, so the refresh doesn't cut the animation short.
+                    const wait = startedAt + ANIMATION_DELAY + FADE_OUT_DURATION - Date.now();
+
+                    setTimeout(() => this.$refs.listing?.refresh(), Math.max(0, wait));
+                });
+        },
+
+        openDrop(path, files) {
+            const now = Date.now();
+            const open = this.drops.find((drop) => drop.path === path && !drop.closing);
+
+            // Dropping into a folder that's already open drops the new files in without reopening it.
+            if (open) {
+                open.pending++;
+                open.files = files;
+                open.fileKey = now;
+                return;
+            }
+
+            this.drops = [
+                ...this.drops.filter((drop) => drop.path !== path),
+                { id: now, fileKey: now, path, files, pending: 1, openedAt: now, closing: false },
+            ];
+        },
+
+        closeDrop(path) {
+            const drop = this.drops.find((drop) => drop.path === path && !drop.closing);
+
+            if (!drop || --drop.pending > 0) return;
+
+            const wait = drop.openedAt + FOLDER_MIN_OPEN_DURATION - Date.now();
+
+            setTimeout(() => {
+                // Another move into the same folder may have started while we waited.
+                if (drop.pending > 0) return;
+
+                drop.closing = true;
+
+                setTimeout(() => (this.drops = this.drops.filter((other) => other !== drop)), FOLDER_CLOSE_DURATION);
+            }, Math.max(0, wait));
+        },
+
+        removeMovedItems(items) {
+            const stillMoved = items.filter((item) => this.moved.includes(item));
+
+            if (!stillMoved.length) return;
+
+            this.reflow();
+            this.removed.push(...stillMoved);
+        },
+
+        forgetMoves(items) {
+            this.moving = this.moving.filter((item) => !items.includes(item));
+            this.moved = this.moved.filter((item) => !items.includes(item));
+            this.removed = this.removed.filter((item) => !items.includes(item));
+        },
+
+        settleMoves() {
+            this.forgetMoves(this.settlingMoves.flatMap(({ items }) => items));
+
+            this.settlingMoves.forEach(({ callback }) => {
+                // Moved assets get new IDs, so the action tells us how to keep them selected. Doing it in the
+                // same render as the refresh stops them visibly deselecting before they disappear.
+                if (callback) Statamic.$callbacks.call(callback[0], ...callback.slice(1));
+            });
+
+            this.settlingMoves = [];
+
+            // Keep the progress bar going while another move is still in flight.
+            this.loading = this.moving.length > 0 || this.moved.length > 0;
+        },
+
+        reflow() {
+            this.reflowing = true;
+
+            clearTimeout(this.reflowTimeout);
+            this.reflowTimeout = setTimeout(() => (this.reflowing = false), REFLOW_DURATION);
+        },
+
+        moveDraggedItemToFolder(path) {
+            this.$refs[this.mode]?.handleFolderDrop({ path });
+        },
+
+        selectRange(from, to) {
+            for (var i = from; i <= to; i++) {
+                let asset = this.assets[i].id;
+                if (!this.selectedAssets.includes(asset) && !this.reachedSelectionLimit) {
+                    this.selectedAssets.push(asset);
+                }
+                this.$emit('selections-updated', this.selectedAssets);
+            }
+        },
+
+        shiftDown() {
+            this.shifting = true;
+        },
+
+        sorted(column, direction) {
+            this.sortColumn = column;
+            this.sortDirection = direction;
+        },
+
+        toggleSelection(id, index, $event) {
+            const i = this.selectedAssets.indexOf(id);
+            this.$refs.browser.focus();
+
+            if (this.maxFiles === 1) {
+                this.selectedAssets = [id];
+            } else if (i != -1) {
+                this.selectedAssets.splice(i, 1);
+            } else if (!this.reachedSelectionLimit) {
+                if ($event.shiftKey && this.lastItemClicked !== null) {
+                    this.selectRange(Math.min(this.lastItemClicked, index), Math.max(this.lastItemClicked, index));
+                } else {
+                    this.selectedAssets.push(id);
+                }
+            }
+            this.$emit('selections-updated', this.selectedAssets);
+            this.lastItemClicked = index;
+        },
+
+        uploadCompleted(asset) {
+            if (this.autoselectUploads) {
+                this.autoselect(asset.id);
+            }
+
+            this.loadAssets();
+            this.$toast.success(__(':file uploaded', { file: asset.basename }));
+        },
+
+        autoselect(id) {
+            this.sortColumn = 'last_modified';
+            this.sortDirection = 'desc';
+
+            if (this.maxFiles === 1) {
+                this.selectedAssets.splice(0, this.selectedAssets.length, id);
+            } else if (!this.reachedSelectionLimit) {
+                this.selectedAssets.push(id);
+            }
+            this.$emit('selections-updated', this.selectedAssets);
+        },
+
+        uploadError(upload, uploads) {
+            this.uploads = uploads;
+            this.$toast.error(upload.errorMessage);
+        },
+
+        uploadsUpdated(uploads) {
+            this.uploads = uploads;
+        },
+
+        addToCommandPalette() {
+            Statamic.$commandPalette.add({
+                when: () => this.canUpload,
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Upload'),
+                icon: 'upload',
+                action: () => this.openFileBrowser(),
+                prioritize: true,
+            });
+
+            Statamic.$commandPalette.add({
+                when: () => this.canCreateFolders,
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Create Folder'),
+                icon: 'folder-add',
+                action: () => this.startCreatingFolder(),
+            });
+
+            Statamic.$commandPalette.add({
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Toggle Grid Layout'),
+                icon: 'layout-grid',
+                when: () => this.mode === 'table',
+                action: () => this.mode = 'grid',
+            });
+
+            Statamic.$commandPalette.add({
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Toggle List Layout'),
+                icon: 'layout-list',
+                when: () => this.mode === 'grid',
+                action: () => this.mode = 'table',
+            });
+
+            if (this.createContainerUrl) {
+                Statamic.$commandPalette.add({
+                    when: () => this.canCreateContainers,
+                    category: Statamic.$commandPalette.category.Actions,
+                    text: __('Create Container'),
+                    icon: 'container-add',
+                    url: this.createContainerUrl,
+                });
+            }
+
+            Statamic.$commandPalette.add({
+                when: () => this.container.can_edit,
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Configure Container'),
+                icon: 'cog',
+                url: this.container.edit_url,
+            });
+
+            Statamic.$commandPalette.add({
+                when: () => this.container.can_edit_blueprint,
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Edit Blueprint'),
+                icon: 'blueprint-edit',
+                url: this.container.blueprint_url,
+            });
+
+            Statamic.$commandPalette.add({
+                when: () => this.container.can_delete,
+                category: Statamic.$commandPalette.category.Actions,
+                text: __('Delete Container'),
+                icon: 'trash',
+                action: () => this.$refs.deleter.confirm(),
+            });
+
+            this.container.actions?.forEach(action => Statamic.$commandPalette.add({
+                when: () => Boolean(this.$refs.containerActions),
+                category: Statamic.$commandPalette.category.Actions,
+                text: [__('Container'), action.title],
+                icon: action.icon,
+                action: () => this.$refs.containerActions.preparedActions
+                    .find(prepared => prepared.handle === action.handle)
+                    ?.run(),
+            }));
+        }
+    },
+};
+</script>

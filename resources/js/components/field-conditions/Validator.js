@@ -1,0 +1,380 @@
+import Converter from './Converter.js';
+import ParentResolver from './ParentResolver.js';
+import { KEYS } from './Constants.js';
+import { data_get } from '../../util/data_get.js';
+import { isObject, intersection } from 'lodash-es';
+
+const NUMBER_SPECIFIC_COMPARISONS = ['>', '>=', '<', '<='];
+const CUSTOM_PREFIX_RE = /^custom /;
+const ROOT_PREFIX_RE = /^\$?root\./;
+
+const isEmpty = (value) => {
+    if (value === null || value === undefined) return true;
+
+    // Object.keys() would consider numbers and booleans empty.
+    if (typeof value === 'number' || typeof value === 'boolean') return false;
+
+    return Array.isArray(value) ? value.length === 0 : Object.keys(value).length === 0;
+};
+
+const isString = (str) => str != null && typeof str.valueOf() === 'string';
+
+const COMPARISONS = {
+    '==': (lhs, rhs) => lhs == rhs,
+    '!=': (lhs, rhs) => lhs != rhs,
+    '===': (lhs, rhs) => lhs === rhs,
+    '!==': (lhs, rhs) => lhs !== rhs,
+    '>': (lhs, rhs) => lhs > rhs,
+    '>=': (lhs, rhs) => lhs >= rhs,
+    '<': (lhs, rhs) => lhs < rhs,
+    '<=': (lhs, rhs) => lhs <= rhs,
+};
+
+// prepareLhs() and prepareRhs() JSON-encode string operands, so decode them before comparing.
+// Non-string operands, like an undefined lhs, aren't valid JSON and are compared as is.
+const decodeOperand = (operand) => (isString(operand) ? JSON.parse(operand) : operand);
+
+export default class {
+    constructor(field, values, rootValues, currentFieldPath, revealerFields, extraPayload) {
+        this.field = field;
+        this.values = values;
+        this.currentFieldPath = currentFieldPath;
+        this.revealerFields = revealerFields;
+        this.extraPayload = extraPayload;
+        this.rootValues = rootValues || false;
+        this.passOnAny = false;
+        this.showOnPass = true;
+        this.converter = new Converter();
+        this._conditionsResolved = false;
+    }
+
+    usingRootValues() {
+        if (!this.currentFieldPath) {
+            throw new Error('[currentFieldPath] constructor param required for `usingRootValues()`');
+        }
+
+        this.rootValues = this.values;
+
+        if (this.currentFieldPath.includes('.')) {
+            return this.scopeValuesToParent();
+        }
+
+        return this;
+    }
+
+    passesConditions(specificConditions) {
+        let conditions = specificConditions || this.getConditions();
+
+        if (conditions === undefined) {
+            return true;
+        } else if (this.isCustomConditionWithoutTarget(conditions)) {
+            let passes = this.passesCustomCondition(this.prepareCondition(conditions));
+
+            return this.showOnPass ? passes : !passes;
+        }
+
+        let passes = this.passOnAny ? this.passesAnyConditions(conditions) : this.passesAllConditions(conditions);
+
+        return this.showOnPass ? passes : !passes;
+    }
+
+    getConditions() {
+        // Memoized per instance. It's not a pure getter — it also sets passOnAny and
+        // showOnPass — so a cached call has to replay them. Like the uncached path, the
+        // replay only ever sets the flags; it never puts them back to their defaults.
+        if (this._conditionsResolved) {
+            if (this._setPassOnAny) this.passOnAny = true;
+            if (this._setShowOffPass) this.showOnPass = false;
+
+            return this._conditions;
+        }
+
+        this._conditionsResolved = true;
+        this._setPassOnAny = false;
+        this._setShowOffPass = false;
+        this._conditions = undefined;
+
+        let key = KEYS.filter((key) => this.field[key])[0];
+
+        if (!key) {
+            return undefined;
+        }
+
+        if (key.includes('any')) {
+            this.passOnAny = this._setPassOnAny = true;
+        }
+
+        if (key.includes('unless') || key.includes('hide_when')) {
+            this.showOnPass = false;
+            this._setShowOffPass = true;
+        }
+
+        let conditions = this.field[key];
+
+        this._conditions = this.isCustomConditionWithoutTarget(conditions)
+            ? conditions
+            : this.converter.fromBlueprint(conditions, this.field.prefix);
+
+        return this._conditions;
+    }
+
+    isCustomConditionWithoutTarget(conditions) {
+        return isString(conditions);
+    }
+
+    passesAllConditions(conditions) {
+        return isEmpty(
+            conditions
+                .map((condition) => this.prepareCondition(condition))
+                .filter((condition) => !this.passesCondition(condition)),
+        );
+    }
+
+    passesAnyConditions(conditions) {
+        return !isEmpty(
+            conditions
+                .map((condition) => this.prepareCondition(condition))
+                .filter((condition) => this.passesCondition(condition)),
+        );
+    }
+
+    prepareCondition(condition) {
+        if (isString(condition) || condition.operator === 'custom') {
+            return this.prepareCustomCondition(condition);
+        }
+
+        let operator = this.prepareOperator(condition.operator);
+        let lhs = this.prepareLhs(condition.field, operator);
+        let rhs = this.prepareRhs(condition.value, operator);
+
+        return { lhs, operator, rhs };
+    }
+
+    prepareOperator(operator) {
+        switch (operator) {
+            case null:
+            case '':
+            case 'is':
+            case 'equals':
+                return '==';
+            case 'isnt':
+            case 'not':
+            case '¯\\_(ツ)_/¯':
+                return '!=';
+            case 'includes':
+            case 'contains':
+                return 'includes';
+            case 'includes_any':
+            case 'contains_any':
+        }
+
+        return operator;
+    }
+
+    prepareLhs(field, operator) {
+        let lhs = this.getFieldValue(field);
+
+        // When performing a number comparison, cast to number.
+        if (NUMBER_SPECIFIC_COMPARISONS.includes(operator)) {
+            return Number(lhs);
+        }
+
+        // When performing lhs.includes(), if lhs is not an object or array, cast to string.
+        if ((operator === 'includes' || operator === 'includes_any') && !isObject(lhs)) {
+            return lhs ? lhs.toString() : '';
+        }
+
+        // When lhs is an empty string, cast to null.
+        if (isString(lhs) && isEmpty(lhs)) {
+            lhs = null;
+        }
+
+        // JSON-encode strings, which passesCondition() decodes before comparing.
+        return isString(lhs) ? JSON.stringify(lhs.trim()) : lhs;
+    }
+
+    prepareRhs(rhs, operator) {
+        // When comparing against null, true, false, cast to literals.
+        switch (rhs) {
+            case 'null':
+                return null;
+            case 'true':
+                return true;
+            case 'false':
+                return false;
+        }
+
+        // When performing a number comparison, cast to number.
+        if (NUMBER_SPECIFIC_COMPARISONS.includes(operator)) {
+            return Number(rhs);
+        }
+
+        // When performing a comparison that isn't a plain operator comparison, return rhs as is.
+        if (rhs === 'empty' || operator === 'includes') {
+            return rhs;
+        }
+
+        // Comparisons with _any operators need to be arrayed
+        if (operator === 'contains_any' || operator === 'includes_any') {
+            return rhs.split(',').map((string) => string.trim());
+        }
+
+        // JSON-encode strings, which passesCondition() decodes before comparing.
+        return isString(rhs) ? JSON.stringify(rhs.trim()) : rhs;
+    }
+
+    prepareCustomCondition(condition) {
+        let functionName = this.prepareFunctionName(condition.value || condition);
+        let params = this.prepareParams(condition.value || condition);
+
+        let target = condition.field ? this.getFieldValue(condition.field) : null;
+        let targetHandle = condition.field;
+
+        return { functionName, params, target, targetHandle };
+    }
+
+    prepareFunctionName(condition) {
+        return condition.replace(CUSTOM_PREFIX_RE, '').split(':')[0];
+    }
+
+    prepareParams(condition) {
+        let params = condition.split(':')[1];
+
+        return params ? params.split(',').map((string) => string.trim()) : [];
+    }
+
+    getFieldValue(field) {
+        if (field.startsWith('$parent.')) {
+            field = new ParentResolver(this.currentFieldPath).resolve(field);
+        }
+
+        if (field.startsWith('$root.') || field.startsWith('root.')) {
+            return data_get(this.rootValues, field.replace(ROOT_PREFIX_RE, ''));
+        }
+
+        return data_get(this.values, field);
+    }
+
+    passesCondition(condition) {
+        if (condition.functionName) {
+            return this.passesCustomCondition(condition);
+        }
+
+        if (condition.operator === 'contains_any') {
+            return this.passesContainsAnyCondition(condition);
+        }
+
+        if (condition.operator === 'includes') {
+            return this.passesIncludesCondition(condition);
+        }
+
+        if (condition.operator === 'includes_any') {
+            return this.passesIncludesAnyCondition(condition);
+        }
+
+        if (condition.rhs === 'empty') {
+            condition.lhs = isEmpty(condition.lhs);
+            condition.rhs = true;
+        }
+
+        if (isObject(condition.lhs)) {
+            return false;
+        }
+
+        const compare = COMPARISONS[condition.operator];
+
+        if (!compare) {
+            throw new Error(`Statamic field condition operator [${condition.operator}] is not supported.`);
+        }
+
+        return compare(decodeOperand(condition.lhs), decodeOperand(condition.rhs));
+    }
+
+    passesIncludesCondition(condition) {
+        // Arrays and strings can be searched. Other objects, like a date range, can't.
+        if (typeof condition.lhs?.includes !== 'function') {
+            return false;
+        }
+
+        return condition.lhs.includes(condition.rhs);
+    }
+
+    passesIncludesAnyCondition(condition) {
+        if (Array.isArray(condition.lhs)) {
+            return intersection(condition.lhs, condition.rhs).length;
+        }
+
+        return condition.rhs.includes(condition.lhs);
+    }
+
+    passesContainsAnyCondition(condition) {
+        if (Array.isArray(condition.lhs)) {
+            return intersection(condition.lhs, condition.rhs).length;
+        }
+
+        // Match each value literally, so characters like `.`, `(` or `+` aren't read as a pattern.
+        const lhs = condition.lhs === null || condition.lhs === undefined ? '' : String(condition.lhs);
+
+        return condition.rhs.some((value) => lhs.includes(value));
+    }
+
+    passesCustomCondition(condition) {
+        let customFunction = Statamic.$conditions.get(condition.functionName);
+
+        if (typeof customFunction !== 'function') {
+            console.error(`Statamic field condition [${condition.functionName}] was not properly defined.`);
+            return false;
+        }
+
+        let passes = customFunction({
+            params: condition.params,
+            target: condition.target,
+            targetHandle: condition.targetHandle,
+            values: this.values,
+            root: this.rootValues,
+            fieldPath: this.currentFieldPath,
+            prefix: this.field.prefix,
+            ...this.extraPayload,
+        });
+
+        // Inverting for `unless` and `hide_when` is left to passesConditions(), so a custom
+        // condition nested in a field's conditions isn't inverted twice.
+        return passes;
+    }
+
+    passesNonRevealerConditions(dottedPrefix) {
+        let conditions = this.getConditions();
+
+        if (this.isCustomConditionWithoutTarget(conditions)) {
+            return this.passesConditions(conditions);
+        }
+
+        let revealerFields = this.revealerFields || [];
+
+        let nonRevealerConditions = (this.getConditions() ?? []).filter(
+            (condition) => !revealerFields.includes(this.relativeLhsToAbsoluteFieldPath(condition.field, dottedPrefix)),
+        );
+
+        return this.passesConditions(nonRevealerConditions);
+    }
+
+    relativeLhsToAbsoluteFieldPath(lhs, dottedPrefix) {
+        if (lhs.startsWith('$parent.')) {
+            lhs = new ParentResolver(this.currentFieldPath).resolve(lhs);
+        }
+
+        if (lhs.startsWith('$root.') || lhs.startsWith('root.')) {
+            return lhs.replace(ROOT_PREFIX_RE, '');
+        }
+
+        return dottedPrefix ? dottedPrefix + '.' + lhs : lhs;
+    }
+
+    scopeValuesToParent() {
+        let scope = this.currentFieldPath.replace(new RegExp('\.[^\.]+$'), '');
+
+        this.values = data_get(this.rootValues, scope);
+
+        return this;
+    }
+}

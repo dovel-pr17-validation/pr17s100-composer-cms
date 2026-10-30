@@ -1,0 +1,281 @@
+<template>
+    <portal name="grid-fullscreen" :disabled="!fullScreenMode" :provide="provide">
+        <element-container @resized="containerWidth = $event.width">
+            <div :class="{ '@apply fixed inset-0 min-h-screen overflow-scroll rounded-none bg-gray-100 dark:bg-gray-900': fullScreenMode }">
+                <publish-field-fullscreen-header
+                    v-if="fullScreenMode"
+                    :title="config.display"
+                    :field-actions="fieldActions"
+                    @close="fullScreenMode = false"
+                >
+                </publish-field-fullscreen-header>
+
+                <section :class="{ 'mt-14 p-4': fullScreenMode }">
+
+                    <ui-error-message v-if="hasExcessRows" :text="__('Max Rows') + ': ' + maxRows" />
+                    <ui-error-message v-else-if="hasNotEnoughRows" :text="__('Min Rows') + ': ' + minRows" />
+
+                    <div
+                        v-if="isReadOnly && (!value || value.length === 0)"
+                        class="rounded-lg border border-dashed border-gray-300 bg-gray-50 px-3 py-3 text-center text-sm text-gray-400 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-400"
+                        data-grid-readonly-empty
+                    >
+                        {{ __('None') }}
+                    </div>
+
+                    <component
+                        v-if="(value && value.length > 0) || !isReadOnly"
+                        :is="component"
+                        :fields="fields"
+                        :rows="value"
+                        :meta="meta.existing"
+                        :name="name"
+                        :can-delete-rows="canDeleteRows"
+                        :can-add-rows="canAddRows"
+                        :allow-fullscreen="config.fullscreen"
+                        :hide-display="config.hide_display"
+                        :read-only="isReadOnly"
+                        :errors="publishContainer.errors"
+                        @updated="updated"
+                        @meta-updated="updateRowMeta"
+                        @removed="removed"
+                        @duplicate="duplicate"
+                        @sorted="sorted"
+                        @moved="moved"
+                        @focus="focused = true"
+                        @blur="blurred"
+                    />
+
+                    <ui-button size="sm" v-if="canAddRows" v-text="__(addRowButtonLabel)" @click.prevent="addRow" />
+                </section>
+            </div>
+        </element-container>
+
+        <confirmation-modal
+            :open="deletingRow !== null"
+            :title="__('Delete Row')"
+            :body-text="__('Are you sure?')"
+            :button-text="__('Delete')"
+            :danger="true"
+            @confirm="confirmDelete"
+            @cancel="deletingRow = null"
+        />
+    </portal>
+</template>
+
+<script>
+import Fieldtype from '../Fieldtype.vue';
+import { nanoid as uniqid } from 'nanoid';
+import GridTable from './Table.vue';
+import GridStacked from './Stacked.vue';
+import ManagesRowMeta from './ManagesRowMeta';
+import { arrayMove } from '../../sortable/Sortable';
+
+export default {
+    mixins: [Fieldtype, ManagesRowMeta],
+
+    components: {
+        GridTable,
+        GridStacked,
+    },
+
+    data() {
+        return {
+            containerWidth: null,
+            focused: false,
+            fullScreenMode: false,
+            deletingRow: null,
+            provide: {
+                grid: this.makeGridProvide(),
+            },
+        };
+    },
+
+    provide: {
+        isInGridField: true,
+    },
+
+    computed: {
+        component() {
+            const stackAt = this.config.stack_at ?? 550;
+            const isNarrow = this.fields.length > 1 && this.containerWidth < stackAt;
+
+            return this.config.mode === 'stacked' || isNarrow ? 'GridStacked' : 'GridTable';
+        },
+
+        fields() {
+            return this.config.fields;
+        },
+
+        minRows() {
+            return this.config.min_rows || 0;
+        },
+
+        maxRows() {
+            return this.config.max_rows || Infinity;
+        },
+
+        canAddRows() {
+            return !this.isReadOnly && this.value.length < this.maxRows;
+        },
+
+        canDeleteRows() {
+            return !this.isReadOnly && this.value.length > this.minRows;
+        },
+
+        addRowButtonLabel() {
+            return __(this.config.add_row) || __('Add Row');
+        },
+
+        hasMaxRows() {
+            return this.maxRows != null;
+        },
+
+        hasExcessRows() {
+            return this.value.length - this.maxRows > 0;
+        },
+
+        hasNotEnoughRows() {
+            return this.value.length - this.minRows < 0;
+        },
+
+        isReorderable() {
+            return !this.isReadOnly && this.config.reorderable && this.maxRows > 1;
+        },
+
+        replicatorPreview() {
+            if (!this.showFieldPreviews) return;
+
+            return `${__(this.config.display)}: ${__n(':count row|:count rows', this.value.length)}`;
+        },
+
+        internalFieldActions() {
+            return [
+                {
+                    title: __('Toggle Fullscreen Mode'),
+                    icon: ({ vm }) => (vm.fullScreenMode ? 'fullscreen-close' : 'fullscreen-open'),
+                    quick: true,
+                    visible: this.config.fullscreen,
+                    visibleWhenReadOnly: true,
+                    run: this.toggleFullScreen,
+                },
+            ];
+        },
+    },
+
+    watch: {
+        isReorderable: {
+            immediate: true,
+            handler(reorderable) {
+                this.reorderable = reorderable;
+            },
+        },
+
+        focused(focused, oldFocused) {
+            if (focused === oldFocused) return;
+
+            if (focused) return this.$emit('focus');
+
+            setTimeout(() => {
+                if (!this.$el.contains(document.activeElement)) {
+                    this.$emit('blur');
+                }
+            }, 1);
+        },
+    },
+
+    methods: {
+        addRow() {
+            const id = uniqid();
+            const defaults = JSON.parse(JSON.stringify(this.meta.defaults));
+
+            const row = Object.fromEntries(
+                this.fields.map((field) => [field.handle, defaults[field.handle]]),
+            );
+
+            row._id = id;
+
+            this.updateRowMeta(id, this.meta.new);
+            this.update([...this.value, row]);
+        },
+
+        updated(index, row) {
+            this.update([...this.value.slice(0, index), row, ...this.value.slice(index + 1)]);
+        },
+
+        removed(index) {
+            // if the row is empty, don't show the confirmation. this.value[index] is an object with the row data
+            const row = this.value[index];
+            const defaults = JSON.parse(JSON.stringify(this.meta.defaults));
+            const emptyRow = Object.fromEntries(
+                this.fields.map((field) => [field.handle, defaults[field.handle]]),
+            );
+
+            // Check if the row has been modified from its default state
+            const hasChanges = this.fields.some(field => row[field.handle] !== emptyRow[field.handle]);
+
+            if (hasChanges) {
+                this.deletingRow = index;
+                return;
+            }
+
+            this.update([...this.value.slice(0, index), ...this.value.slice(index + 1)]);
+        },
+
+        confirmDelete() {
+            this.update([...this.value.slice(0, this.deletingRow), ...this.value.slice(this.deletingRow + 1)]);
+            this.deletingRow = null;
+        },
+
+        duplicate(index) {
+            const original = this.value[index];
+            const { values: row, meta } = this.duplicateValues(original, this.meta.existing[original._id]);
+
+            this.updateRowMeta(row._id, meta);
+
+            this.update([...this.value, row]);
+        },
+
+        sorted(rows) {
+            this.update(rows);
+        },
+
+        moved(from, to) {
+            if (from === to || to < 0 || to >= this.value.length) return;
+
+            this.update(arrayMove(this.value, from, to));
+        },
+
+        focus() {
+            // TODO
+        },
+
+        blurred() {
+            setTimeout(() => {
+                if (!this.$el.contains(document.activeElement)) {
+                    this.focused = false;
+                }
+            }, 1);
+        },
+
+        toggleFullScreen() {
+            this.fullScreenMode = !this.fullScreenMode;
+        },
+
+        makeGridProvide() {
+            const grid = {};
+            Object.defineProperties(grid, {
+                config: { get: () => this.config },
+                isReorderable: { get: () => this.isReorderable },
+                isReadOnly: { get: () => this.isReadOnly },
+                handle: { get: () => this.handle },
+                fieldPathPrefix: { get: () => this.fieldPathPrefix },
+                metaPathPrefix: { get: () => this.metaPathPrefix },
+                fullScreenMode: { get: () => this.fullScreenMode },
+                toggleFullScreen: { get: () => this.toggleFullScreen },
+            });
+            return grid;
+        },
+    },
+};
+</script>

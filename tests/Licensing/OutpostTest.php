@@ -1,0 +1,523 @@
+<?php
+
+namespace Tests\Licensing;
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Response;
+use Illuminate\Encryption\Encrypter;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Test;
+use Statamic\Addons\Addon as AddonInstance;
+use Statamic\Addons\Manifest;
+use Statamic\Facades\Addon;
+use Statamic\Licensing\Outpost;
+use Tests\TestCase;
+
+class OutpostTest extends TestCase
+{
+    public function setUp(): void
+    {
+        parent::setUp();
+        Carbon::setTestNow(now()->startOfMinute());
+        Cache::store('outpost')->flush();
+    }
+
+    #[Test]
+    public function it_builds_the_request_payload()
+    {
+        config(['statamic.system.license_key' => 'test-key']);
+        config(['statamic.editions.pro' => true]);
+
+        Addon::shouldReceive('all')->once()->andReturn(collect([
+            new FakeOutpostAddon('foo/bar', '1.2.3', null, true, true),
+            new FakeOutpostAddon('baz/qux', '4.5.6', 'example', true, true),
+        ]));
+
+        request()->server->set('SERVER_ADDR', '123.123.123.123');
+        request()->server->set('SERVER_PORT', 123);
+
+        $this->assertEquals([
+            'key' => 'test-key',
+            'host' => 'localhost',
+            'ip' => '123.123.123.123',
+            'port' => 123,
+            'statamic_version' => '3.0.0-testing',
+            'statamic_pro' => true,
+            'php_version' => PHP_VERSION,
+            'laravel_version' => app()->version(),
+            'packages' => [
+                'foo/bar' => ['version' => '1.2.3', 'edition' => null],
+                'baz/qux' => ['version' => '4.5.6', 'edition' => 'example'],
+            ],
+        ], $this->outpost()->payload());
+    }
+
+    #[Test]
+    public function it_contacts_the_outpost_and_caches_the_response_for_50_to_59_minutes()
+    {
+        $outpost = $this->outpostWithJsonResponse(['foo' => 'bar']);
+
+        $response = $outpost->response();
+
+        $this->assertEquals([
+            'foo' => 'bar',
+            'expiry' => $response['expiry'],
+            'payload' => $outpost->payload(),
+        ], $response);
+        $this->assertExpiresBetween(now()->addMinutes(50), now()->addMinutes(59), $response);
+        $this->assertCachedUntilExpiry($response);
+    }
+
+    #[Test]
+    public function it_sends_the_statamic_user_agent()
+    {
+        $history = [];
+        $handler = HandlerStack::create(new MockHandler([new Response(200, [], '{}')]));
+        $handler->push(Middleware::history($history));
+
+        $this->outpost(new Client(['handler' => $handler]))->response();
+
+        $this->assertEquals('Statamic/3.0.0-testing', $history[0]['request']->getHeaderLine('User-Agent'));
+    }
+
+    #[Test]
+    public function the_cached_response_is_used()
+    {
+        $outpost = $this->outpostWithJsonResponse(['newer' => 'response']);
+
+        $this->setCachedResponse($testCachedResponse = [
+            'cached' => 'response',
+            'payload' => $outpost->payload(),
+        ]);
+
+        $first = $outpost->response();
+        $second = $outpost->response();
+
+        $this->assertEquals($testCachedResponse, $first);
+        $this->assertSame($first, $second);
+    }
+
+    #[Test]
+    public function the_cached_response_is_used_when_only_the_environment_has_changed()
+    {
+        $outpost = $this->outpostWithJsonResponse(['newer' => 'response']);
+
+        $payload = $outpost->payload();
+        $payload['host'] = 'some-other-host.com';
+        $payload['ip'] = '9.9.9.9';
+        $payload['port'] = null;
+        $payload['php_version'] = '1.2.3';
+
+        $this->setCachedResponse($testCachedResponse = [
+            'cached' => 'response',
+            'payload' => $payload,
+        ]);
+
+        $this->assertEquals($testCachedResponse, $outpost->response());
+    }
+
+    #[Test]
+    public function license_key_file_is_used_when_it_exists()
+    {
+        config(['statamic.system.license_key' => 'testsitekey12345']);
+
+        $encrypter = new Encrypter('testsitekey12345');
+        $encryptedKeyFile = $encrypter->encrypt(json_encode([
+            'foo' => 'bar',
+            'packages' => [],
+        ]));
+
+        File::shouldReceive('exists')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturnTrue();
+
+        File::shouldReceive('get')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturn($encryptedKeyFile);
+
+        $outpost = $this->outpostWithJsonResponse(['newer' => 'response']);
+        $response = $outpost->response();
+
+        $this->assertArraySubset([
+            'foo' => 'bar',
+            'packages' => [],
+        ], $response);
+    }
+
+    #[Test]
+    public function license_key_file_response_merges_installed_addons_into_response()
+    {
+        config(['statamic.system.license_key' => 'testsitekey12345']);
+
+        $encrypter = new Encrypter('testsitekey12345');
+        $encryptedKeyFile = $encrypter->encrypt(json_encode(['packages' => [
+            'foo/bar' => ['valid' => true, 'exists' => true, 'version_limit' => null],
+        ]]));
+
+        File::shouldReceive('exists')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturnTrue();
+
+        File::shouldReceive('get')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturn($encryptedKeyFile);
+
+        Addon::shouldReceive('all')->andReturn(collect([
+            (new FakeOutpostAddon('foo/bar', '1.2.3', null, true, true)),
+            (new FakeOutpostAddon('bar/baz', '1.2.3', null, true, true)),
+            (new FakeOutpostAddon('private/addon', '1.2.3', null, false, false)),
+        ]));
+
+        $outpost = $this->outpostWithJsonResponse(['newer' => 'response']);
+        $response = $outpost->response();
+
+        $this->assertArraySubset([
+            'packages' => [
+                'foo/bar' => ['valid' => true, 'exists' => true, 'version_limit' => null],
+                'bar/baz' => ['valid' => false, 'exists' => true, 'version_limit' => null],
+                'private/addon' => ['valid' => true, 'exists' => false, 'version_limit' => null],
+            ],
+        ], $response);
+    }
+
+    #[Test]
+    public function license_key_file_response_excludes_packages_that_are_not_installed()
+    {
+        config(['statamic.system.license_key' => 'testsitekey12345']);
+
+        $encrypter = new Encrypter('testsitekey12345');
+        $encryptedKeyFile = $encrypter->encrypt(json_encode(['packages' => [
+            'foo/bar' => ['valid' => true, 'exists' => true, 'version_limit' => null],
+            'not/installed' => ['valid' => false, 'exists' => true, 'version_limit' => null],
+        ]]));
+
+        File::shouldReceive('exists')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturnTrue();
+
+        File::shouldReceive('get')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturn($encryptedKeyFile);
+
+        Addon::shouldReceive('all')->andReturn(collect([
+            (new FakeOutpostAddon('foo/bar', '1.2.3', null, true, true)),
+        ]));
+
+        $response = $this->outpost()->response();
+
+        $this->assertEquals([
+            'foo/bar' => ['valid' => true, 'exists' => true, 'version_limit' => null],
+        ], $response['packages']);
+    }
+
+    #[Test]
+    public function license_key_file_response_doesnt_fetch_marketplace_data()
+    {
+        config(['statamic.system.license_key' => 'testsitekey12345']);
+
+        $encrypter = new Encrypter('testsitekey12345');
+        $encryptedKeyFile = $encrypter->encrypt(json_encode(['packages' => []]));
+
+        File::shouldReceive('exists')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturnTrue();
+
+        File::shouldReceive('get')
+            ->with(storage_path('license.key'))
+            ->once()
+            ->andReturn($encryptedKeyFile);
+
+        Addon::shouldReceive('all')->andReturn(collect([
+            AddonInstance::makeFromPackage(['id' => 'without/data']),
+            AddonInstance::makeFromPackage(['id' => 'with/data', 'marketplaceId' => 1, 'marketplaceSlug' => 'with-data', 'isCommercial' => true]),
+        ]));
+
+        $this->mock(Manifest::class, fn ($mock) => $mock->shouldNotReceive('fetchPackageDataFromMarketplace'));
+
+        $response = $this->outpost()->response();
+
+        $this->assertEquals([
+            'without/data' => ['valid' => true, 'exists' => false, 'version_limit' => null],
+            'with/data' => ['valid' => false, 'exists' => true, 'version_limit' => null],
+        ], $response['packages']);
+    }
+
+    #[Test]
+    public function the_cached_response_is_ignored_if_the_payload_is_different()
+    {
+        $this->setCachedResponse(['payload' => ['old' => 'stuff']]);
+        $outpost = $this->outpostWithJsonResponse(['newer' => 'response']);
+
+        $response = $outpost->response();
+
+        $this->assertEquals([
+            'newer' => 'response',
+            'expiry' => $response['expiry'],
+            'payload' => $outpost->payload(),
+        ], $response);
+        $this->assertCachedUntilExpiry($response);
+    }
+
+    #[Test]
+    public function it_clears_the_cached_response()
+    {
+        Cache::shouldReceive('store')->andReturn(
+            $this->mock(\Illuminate\Contracts\Cache\Store::class)
+                ->shouldReceive('forget')->once()->with('statamic.outpost.response')->getMock()
+        );
+
+        $this->outpost()->clearCachedResponse();
+    }
+
+    #[Test]
+    public function it_caches_a_timed_out_request_for_5_to_10_minutes()
+    {
+        $outpost = $this->outpostWithResponse(
+            $e = new ConnectException('', new Request('POST', '/v3/query'))
+        );
+
+        $response = $outpost->response();
+
+        $this->assertEquals([
+            'error' => $e->getCode(),
+            'expiry' => $response['expiry'],
+            'payload' => $outpost->payload(),
+        ], $response);
+        $this->assertExpiresBetween(now()->addMinutes(5), now()->addMinutes(10), $response);
+        $this->assertCachedUntilExpiry($response);
+    }
+
+    #[Test]
+    public function it_caches_a_500_error_for_5_to_10_minutes()
+    {
+        $outpost = $this->outpostWithErrorResponse(500);
+
+        $response = $outpost->response();
+
+        $this->assertEquals([
+            'error' => 500,
+            'expiry' => $response['expiry'],
+            'payload' => $outpost->payload(),
+        ], $response);
+        $this->assertExpiresBetween(now()->addMinutes(5), now()->addMinutes(10), $response);
+        $this->assertCachedUntilExpiry($response);
+    }
+
+    #[Test]
+    #[DataProvider('invalidResponseBodyProvider')]
+    public function it_caches_an_invalid_response_body_as_an_error_for_5_to_10_minutes($body)
+    {
+        $outpost = $this->outpostWithResponse(new Response(200, [], $body));
+
+        $response = $outpost->response();
+
+        $this->assertEquals([
+            'error' => 500,
+            'expiry' => $response['expiry'],
+            'payload' => $outpost->payload(),
+        ], $response);
+        $this->assertExpiresBetween(now()->addMinutes(5), now()->addMinutes(10), $response);
+        $this->assertCachedUntilExpiry($response);
+    }
+
+    public static function invalidResponseBodyProvider()
+    {
+        return [
+            'string' => ['ok'],
+            'empty' => [''],
+            'json string' => ['"ok"'],
+            'html' => ['<html></html>'],
+        ];
+    }
+
+    #[Test]
+    public function it_caches_a_429_too_many_requests_error_for_the_length_described_in_the_retry_after_header()
+    {
+        $retryAfter = 23; // arbitrary number
+
+        $outpost = $this->outpostWithErrorResponse(429, [
+            'Retry-After' => [$retryAfter],
+        ]);
+
+        $expectedResponse = [
+            'error' => 429,
+            'expiry' => now()->addSeconds($retryAfter)->timestamp,
+            'payload' => $outpost->payload(),
+        ];
+
+        $this->assertEquals($expectedResponse, $outpost->response());
+        Carbon::setTestNow(now()->addSeconds($retryAfter - 1));
+        $this->assertCachedResponseEquals($expectedResponse);
+        Carbon::setTestNow(now()->addSeconds(1));
+        $this->assertResponseNotCached();
+    }
+
+    #[Test]
+    public function it_caches_a_429_too_many_requests_error_for_five_minutes_when_theres_no_retry_after_header()
+    {
+        $outpost = $this->outpostWithErrorResponse(429);
+
+        $expectedResponse = [
+            'error' => 429,
+            'expiry' => now()->addMinutes(5)->timestamp,
+            'payload' => $outpost->payload(),
+        ];
+
+        $this->assertEquals($expectedResponse, $outpost->response());
+        Carbon::setTestNow(now()->addMinutes(5)->subSecond());
+        $this->assertCachedResponseEquals($expectedResponse);
+        Carbon::setTestNow(now()->addSeconds(1));
+        $this->assertResponseNotCached();
+    }
+
+    #[Test]
+    public function it_caches_a_422_validation_error_for_an_hour()
+    {
+        $outpost = $this->outpostWithErrorResponse(422, [], [
+            'message' => 'The given data was invalid.',
+            'errors' => [
+                'a' => ['error one', 'error two'],
+                'b' => ['error one'],
+            ],
+        ]);
+
+        $expectedResponse = [
+            'error' => 422,
+            'errors' => [
+                'a' => ['error one', 'error two'],
+                'b' => ['error one'],
+            ],
+            'expiry' => now()->addHour()->timestamp,
+            'payload' => $outpost->payload(),
+        ];
+
+        $this->assertEquals($expectedResponse, $outpost->response());
+        Carbon::setTestNow(now()->addHour()->subSecond(1));
+        $this->assertCachedResponseEquals($expectedResponse);
+        Carbon::setTestNow(now()->addSeconds(1));
+        $this->assertResponseNotCached();
+    }
+
+    private function outpostWithJsonResponse(array $data)
+    {
+        return $this->outpostWithResponse(
+            new Response(200, [], json_encode($data))
+        );
+    }
+
+    private function outpostWithErrorResponse(int $status, array $headers = [], array $data = [])
+    {
+        $e = new RequestException(
+            '',
+            new Request('POST', '/v3/query'),
+            new Response($status, $headers, json_encode($data))
+        );
+
+        return $this->outpostWithResponse($e);
+    }
+
+    private function outpostWithResponse($response)
+    {
+        $guzzle = new Client(['handler' => new MockHandler([$response])]);
+
+        return $this->outpost($guzzle);
+    }
+
+    private function outpost($guzzle = null)
+    {
+        return new Outpost($guzzle ?? $this->mock(Client::class));
+    }
+
+    private function assertCachedResponseEquals($expected)
+    {
+        return $this->assertEquals($expected, Cache::store('outpost')->get('statamic.outpost.response'));
+    }
+
+    private function assertResponseNotCached()
+    {
+        $this->assertNull(Cache::store('outpost')->get('statamic.outpost.response'));
+    }
+
+    private function assertExpiresBetween($earliest, $latest, $response)
+    {
+        $this->assertGreaterThanOrEqual($earliest->timestamp, $response['expiry']);
+        $this->assertLessThanOrEqual($latest->timestamp, $response['expiry']);
+    }
+
+    private function assertCachedUntilExpiry($response)
+    {
+        Carbon::setTestNow(Carbon::createFromTimestamp($response['expiry'])->subSecond());
+        $this->assertCachedResponseEquals($response);
+        Carbon::setTestNow(now()->addSecond());
+        $this->assertResponseNotCached();
+    }
+
+    private function setCachedResponse($response)
+    {
+        Cache::store('outpost')->put('statamic.outpost.response', $response);
+    }
+}
+
+class FakeOutpostAddon
+{
+    protected $package;
+    protected $version;
+    protected $edition;
+    protected $existsOnMarketplace;
+    protected $isCommercial;
+
+    public function __construct($package, $version, $edition, $existsOnMarketplace, $isCommercial)
+    {
+        $this->package = $package;
+        $this->version = $version;
+        $this->edition = $edition;
+        $this->existsOnMarketplace = $existsOnMarketplace;
+        $this->isCommercial = $isCommercial;
+    }
+
+    public function package()
+    {
+        return $this->package;
+    }
+
+    public function version()
+    {
+        return $this->version;
+    }
+
+    public function edition()
+    {
+        return $this->edition;
+    }
+
+    public function hasMarketplaceData()
+    {
+        return true;
+    }
+
+    public function existsOnMarketplace()
+    {
+        return $this->existsOnMarketplace;
+    }
+
+    public function isCommercial()
+    {
+        return $this->isCommercial;
+    }
+}
